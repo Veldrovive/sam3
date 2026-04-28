@@ -2218,7 +2218,10 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         use_torchcodec=False,
         use_cv2=False,
         input_is_mp4=False,
+        offload_state_to_cpu=None,
     ):
+        if offload_state_to_cpu is not None:
+            print(f"WARNING: offload_state_to_cpu should be none with multiplex tracking")
         inference_state = super().init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
