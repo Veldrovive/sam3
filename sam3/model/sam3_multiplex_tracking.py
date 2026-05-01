@@ -3046,6 +3046,212 @@ class Sam3MultiplexTrackingWithInteractivity(Sam3MultiplexTracking):
         else:
             return frame_idx, None  # no output on other GPUs
 
+    @torch.inference_mode()
+    def add_sam2_new_mask(
+        self,
+        inference_state,
+        frame_idx,
+        obj_id,
+        mask,
+    ):
+        """Add a new mask prompt to SAM2. Supporting instance refinement to existing
+        objects by passing existing obj_id or adding a new object by passing a new obj_id.
+        Every GPU returns the same results, and results should contain all masks including
+        these masks not refined or not added by the current user points.
+        """
+        assert obj_id is not None, "obj_id must be provided to add new mask"
+        tracker_metadata = inference_state["tracker_metadata"]
+        if tracker_metadata == {}:
+            # initialize masklet metadata if it's uninitialized (empty dict)
+            tracker_metadata.update(self._initialize_metadata())
+
+        obj_rank = self._get_gpu_id_by_obj_id(inference_state, obj_id)
+
+        # prepare feature
+        self._prepare_backbone_feats(inference_state, frame_idx, reverse=False)
+
+        object_has_been_refined = self._has_object_been_refined(inference_state, obj_id)
+        if (
+            obj_rank is not None
+            and self.use_stateless_refinement
+            and not object_has_been_refined
+        ):
+            # The first time we start refinement on the object, we remove it.
+            logger.info(
+                f"[rank={self.rank}] Removing object {obj_id} before refinement."
+            )
+            self.remove_object(inference_state, obj_id, is_user_action=False)
+            obj_rank = None
+        elif obj_rank is not None and not object_has_been_refined:
+            # Extract the object into its own singleton inference state if it belongs to a batch
+            if self.rank == obj_rank and not self.tracker.per_obj_inference:
+                tracker_states = self._get_sam2_inference_states_by_obj_ids(
+                    inference_state, [obj_id]
+                )
+                assert len(tracker_states) == 1
+                sam2_state = tracker_states[0]
+                if len(sam2_state["obj_ids"]) > 1:
+                    logger.info(
+                        f"[rank={self.rank}] Extracting object {obj_id} into singleton inference state."
+                    )
+                    self._extract_object_to_singleton_state(
+                        inference_state, obj_id, obj_rank
+                    )
+
+        if obj_rank is None:
+            # new object, we assign it a GPU and create a new inference state if limit allows
+            num_prev_obj = np.sum(tracker_metadata["num_obj_per_gpu"])
+            if num_prev_obj >= self.max_num_objects:
+                logger.warning(
+                    f"add_sam2_new_mask: cannot add a new object as we are already tracking {num_prev_obj=} "
+                    f"masklets (under {self.max_num_objects=})"
+                )
+                return frame_idx, None
+
+            new_det_gpu_ids = self._assign_new_det_to_gpus(
+                new_det_num=1,
+                prev_workload_per_gpu=tracker_metadata["num_obj_per_gpu"],
+            )
+            obj_rank = new_det_gpu_ids[0]
+
+            if self.rank == obj_rank:
+                if self.tracker.per_obj_inference:
+                    sam2_state = inference_state["sam2_inference_states"][0]
+                else:
+                    sam2_state = self._init_new_sam2_state(inference_state)
+                    inference_state["sam2_inference_states"].append(sam2_state)
+
+            tracker_metadata["obj_ids_per_gpu"][obj_rank] = np.concatenate(
+                [
+                    tracker_metadata["obj_ids_per_gpu"][obj_rank],
+                    np.array([obj_id], dtype=np.int64),
+                ]
+            )
+            tracker_metadata["num_obj_per_gpu"][obj_rank] = len(
+                tracker_metadata["obj_ids_per_gpu"][obj_rank]
+            )
+            tracker_metadata["obj_ids_all_gpu"] = np.concatenate(
+                tracker_metadata["obj_ids_per_gpu"]
+            )
+            tracker_metadata["max_obj_id"] = max(tracker_metadata["max_obj_id"], obj_id)
+
+            logger.info(
+                f"[rank={self.rank}] Adding new object with mask for id {obj_id} at frame {frame_idx}."
+            )
+            self.add_action_history(
+                inference_state, "add", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+        else:
+            # existing object, for refinement
+            if self.rank == obj_rank:
+                tracker_states = self._get_sam2_inference_states_by_obj_ids(
+                    inference_state, [obj_id]
+                )
+                assert len(tracker_states) == 1, (
+                    f"[rank={self.rank}] Multiple SAM2 inference states found for the same object id."
+                )
+                sam2_state = tracker_states[0]
+
+            logger.info(
+                f"[rank={self.rank}] Refining existing object with mask for id {obj_id} at frame {frame_idx}."
+            )
+            self.add_action_history(
+                inference_state, "refine", frame_idx=frame_idx, obj_ids=[obj_id]
+            )
+
+        # assign higher score to added/refined object
+        tracker_metadata["obj_id_to_score"][obj_id] = 1.0
+        tracker_metadata["obj_id_to_sam2_score_frame_wise"][frame_idx][obj_id] = (
+            torch.tensor(1.0, dtype=torch.float32, device=self.device)
+        )
+
+        if self.rank == 0:
+            rank0_metadata = tracker_metadata.get("rank0_metadata", {})
+            if "removed_obj_ids" in rank0_metadata:
+                rank0_metadata["removed_obj_ids"].discard(obj_id)
+            if "suppressed_obj_ids" in rank0_metadata:
+                for frame_id in rank0_metadata["suppressed_obj_ids"]:
+                    rank0_metadata["suppressed_obj_ids"][frame_id].discard(obj_id)
+            if "masklet_confirmation" in rank0_metadata:
+                obj_ids_all_gpu = tracker_metadata["obj_ids_all_gpu"]
+                obj_indices = np.where(obj_ids_all_gpu == obj_id)[0]
+                if len(obj_indices) > 0:
+                    obj_idx = obj_indices[0]
+                    if obj_idx < len(rank0_metadata["masklet_confirmation"]["status"]):
+                        rank0_metadata["masklet_confirmation"]["status"][obj_idx] = 1
+                        rank0_metadata["masklet_confirmation"]["consecutive_det_num"][
+                            obj_idx
+                        ] = self.masklet_confirmation_consecutive_det_thresh
+
+        if self.rank == obj_rank:
+            frame_idx, obj_ids, low_res_masks, video_res_masks = (
+                self.tracker.add_new_mask(
+                    inference_state=sam2_state,
+                    frame_idx=frame_idx,
+                    obj_id=obj_id,
+                    mask=mask,
+                )
+            )
+
+            # process masks
+            if video_res_masks is not None and len(video_res_masks) > 0:
+                video_res_masks = fill_holes_in_mask_scores(
+                    video_res_masks,
+                    fill_hole_area=self.fill_hole_area,
+                    sprinkle_removal_area=self.sprinkle_removal_area,
+                    fill_holes=True,
+                    remove_sprinkles=True,
+                )
+        else:
+            obj_ids, low_res_masks, video_res_masks = [], None, None
+
+        # Gather output across GPUs
+        (
+            obj_id_to_mask,
+            obj_id_to_sam2_score,
+            tracker_metadata,
+        ) = self._gather_obj_id_to_mask_across_gpus(
+            inference_state=inference_state,
+            obj_id_to_mask_local=dict(zip(obj_ids, video_res_masks))
+            if video_res_masks is not None
+            else {},
+            obj_id_to_sam2_score_local=dict(zip(obj_ids, [1.0] * len(obj_ids))),
+            tracker_metadata=tracker_metadata,
+            frame_idx=frame_idx,
+        )
+
+        if self.rank == 0:
+            suppressed_obj_ids = []
+            if "rank0_metadata" in tracker_metadata:
+                suppressed_obj_ids = tracker_metadata["rank0_metadata"].get(
+                    "suppressed_obj_ids", {}
+                ).get(frame_idx, [])
+                suppressed_obj_ids = [
+                    obj_id for obj_id in suppressed_obj_ids if obj_id in obj_id_to_mask
+                ]
+
+            obj_id_to_score = {
+                obj_id: tracker_metadata["obj_id_to_score"].get(obj_id, 0.0)
+                for obj_id in obj_id_to_mask
+            }
+
+            out = {
+                "obj_id_to_mask": obj_id_to_mask,
+                "obj_id_to_score": obj_id_to_score,
+                "obj_id_to_sam2_score": obj_id_to_sam2_score,
+            }
+            self._cache_frame_outputs(
+                inference_state,
+                frame_idx,
+                obj_id_to_mask,
+                suppressed_obj_ids=suppressed_obj_ids,
+            )
+            return frame_idx, self._postprocess_output(
+                inference_state, out, suppressed_obj_ids=suppressed_obj_ids
+            )
+        else:
+            return frame_idx, None  # no output on other GPUs
+
     def _get_mask_input(self, inference_state, frame_idx, obj_id):
         """Get the mask input for a specific object on a specific frame."""
         obj_idx = self.tracker._obj_id_to_idx(inference_state, obj_id)
